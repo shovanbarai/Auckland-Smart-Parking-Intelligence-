@@ -1,0 +1,521 @@
+# ============================================================
+# ONE CSV EXPORT FOR POWER BI
+# HISTORICAL + LIVE API + ML FORECAST
+# POWER BI NUMERIC-COMPATIBLE VERSION
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import requests
+import time
+from bs4 import BeautifulSoup
+from datetime import timedelta
+from pathlib import Path
+
+output_path = "/content/drive/MyDrive/ParkingProject/data/parking_powerbi_dashboard.csv"
+
+name_fix_map = {
+    "Victoria St": "Victoria Street"
+}
+
+total_spaces_map = {
+    "Civic": 930,
+    "Ronwood": 678,
+    "Toka Puia": 420,
+    "Victoria Street": 895
+}
+
+def demand_level_from_percent(x):
+    if pd.isna(x):
+        return "Unknown"
+    if x >= 70:
+        return "High"
+    elif x >= 30:
+        return "Medium"
+    else:
+        return "Low"
+
+def extract_street(loc):
+    return str(loc).split("_")[0]
+
+def safe_coords(loc):
+    try:
+        return get_coords(loc)
+    except:
+        return (-36.8485, 174.7633)
+
+def build_powerbi_dataset():
+
+    # ========================================================
+    # COMMON MODEL SETTINGS
+    # ========================================================
+
+    location_map = dict(zip(le.classes_, le.transform(le.classes_)))
+
+    features_nolag = [
+        "location_encoded",
+        "hour", "day_of_week", "month", "is_weekend",
+        "temperature", "precipitation", "is_rain", "rain_level",
+        "hour_sin", "hour_cos", "hour_weekend", "rain_hour", "temp_hour"
+    ]
+
+    # ========================================================
+    # 1. HISTORICAL DATA
+    # ========================================================
+
+    hist = akl_big.copy()
+
+    hist["timestamp"] = pd.to_datetime(hist["timestamp_hour"])
+    hist["date"] = hist["timestamp"].dt.date
+    hist["street"] = hist["location_id"].apply(extract_street)
+
+    hist["lat"] = hist["location_id"].map(lambda x: safe_coords(x)[0])
+    hist["lon"] = hist["location_id"].map(lambda x: safe_coords(x)[1])
+
+    hist["occupancy_rate"] = (hist["occupancy_rate"] * 100).clip(0, 100).round(2)
+    hist["availability_rate"] = (100 - hist["occupancy_rate"]).round(2)
+
+    hist["predicted_occupancy_rate"] = 0
+    hist["forecast_lower"] = 0
+    hist["forecast_upper"] = 0
+
+    hist["available_spaces"] = 0
+    hist["total_spaces"] = 0
+    hist["cars"] = 0
+    hist["predicted_cars"] = 0
+
+    hist["demand_level"] = hist["occupancy_rate"].apply(demand_level_from_percent)
+
+    hist["day_name"] = hist["timestamp"].dt.day_name()
+    hist["hour"] = hist["timestamp"].dt.hour
+    hist["month"] = hist["timestamp"].dt.month
+    hist["is_weekend"] = hist["timestamp"].dt.dayofweek.isin([5, 6]).astype(int)
+
+    hist["data_type"] = "Historical"
+    hist["last_updated"] = pd.Timestamp.now()
+    hist["api_status"] = "Historical Data"
+    hist["parking_type"] = "Historical"
+
+    hist["current_occupancy"] = hist["occupancy_rate"]
+    hist["predicted_next"] = hist["predicted_occupancy_rate"]
+    hist["predicted_next_hour"] = hist["predicted_occupancy_rate"]
+
+    # ========================================================
+    # 2. LIVE API DATA
+    # ========================================================
+
+    url = "https://at.govt.nz/umbraco/surface/parkingavailabilitysurface/ParkingAvailabilityResult"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    response = requests.get(url, headers=headers, timeout=30)
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.find_all("div", class_="divTableRow")
+
+    live_rows = []
+
+    for row in rows:
+        cells = row.find_all("div", class_="divTableCell")
+
+        if len(cells) < 3:
+            continue
+
+        location = cells[0].get_text(strip=True)
+        ptype = cells[1].get_text(strip=True)
+        available = cells[2].get_text(strip=True)
+
+        if location == "Car park":
+            continue
+
+        if ptype != "Short-term":
+            continue
+
+        available = (
+            str(available)
+            .replace(",", "")
+            .replace("spaces", "")
+            .strip()
+        )
+
+        try:
+            available = int(float(available))
+        except:
+            continue
+
+        location = name_fix_map.get(location, location)
+
+        if location not in total_spaces_map:
+            continue
+
+        live_rows.append({
+            "location_id": location,
+            "street": location,
+            "parking_type": ptype,
+            "available_spaces": available,
+            "total_spaces": total_spaces_map[location]
+        })
+
+    live = pd.DataFrame(live_rows)
+
+    if len(live) > 0:
+
+        now = pd.Timestamp.now().floor("min")
+        future_time = now + timedelta(hours=1)
+
+        live["timestamp"] = now
+        live["date"] = now.date()
+        live["last_updated"] = now
+
+        live["available_spaces"] = pd.to_numeric(
+            live["available_spaces"],
+            errors="coerce"
+        ).fillna(0)
+
+        live["total_spaces"] = pd.to_numeric(
+            live["total_spaces"],
+            errors="coerce"
+        ).fillna(0)
+
+        live["occupancy_now"] = (
+            1 - (live["available_spaces"] / live["total_spaces"])
+        ).clip(0, 1)
+
+        live["occupancy_rate"] = (live["occupancy_now"] * 100).round(2)
+        live["availability_rate"] = (100 - live["occupancy_rate"]).round(2)
+
+        live["hour"] = future_time.hour
+        live["day_of_week"] = future_time.dayofweek
+        live["month"] = future_time.month
+        live["is_weekend"] = 1 if future_time.dayofweek >= 5 else 0
+
+        live["hour_sin"] = np.sin(2 * np.pi * live["hour"] / 24)
+        live["hour_cos"] = np.cos(2 * np.pi * live["hour"] / 24)
+        live["hour_weekend"] = live["hour"] * live["is_weekend"]
+
+        latest = akl_big.sort_values("timestamp_hour").iloc[-1]
+
+        live["temperature"] = latest["temperature"]
+        live["precipitation"] = latest["precipitation"]
+        live["is_rain"] = latest["is_rain"]
+        live["rain_level"] = latest["rain_level"]
+
+        live["rain_hour"] = live["hour"] * live["is_rain"]
+        live["temp_hour"] = live["hour"] * live["temperature"]
+
+        live["location_encoded"] = live["location_id"].map(location_map).fillna(-1)
+
+        pred_live = model_nolag.predict(live[features_nolag])
+        pred_live = np.clip(pred_live, 0, 1)
+
+        max_change = 0.2 + 0.3 * live["is_weekend"]
+
+        pred_live = np.clip(
+            pred_live,
+            live["occupancy_now"] - max_change,
+            live["occupancy_now"] + max_change
+        )
+
+        live["predicted_occupancy_rate"] = (pred_live * 100).round(2)
+        live["forecast_lower"] = (live["predicted_occupancy_rate"] - 5).clip(0, 100)
+        live["forecast_upper"] = (live["predicted_occupancy_rate"] + 5).clip(0, 100)
+
+        live["cars"] = (
+            live["occupancy_now"] * live["total_spaces"]
+        ).round(0)
+
+        live["predicted_cars"] = (
+            pred_live * live["total_spaces"]
+        ).round(0)
+
+        live["lat"] = live["location_id"].map(lambda x: safe_coords(x)[0])
+        live["lon"] = live["location_id"].map(lambda x: safe_coords(x)[1])
+
+        live["demand_level"] = live["predicted_occupancy_rate"].apply(
+            demand_level_from_percent
+        )
+
+        live["day_name"] = pd.to_datetime(live["timestamp"]).dt.day_name()
+
+        live["data_type"] = "Live"
+        live["api_status"] = "Connected"
+
+        live["current_occupancy"] = live["occupancy_rate"]
+        live["predicted_next"] = live["predicted_occupancy_rate"]
+        live["predicted_next_hour"] = live["predicted_occupancy_rate"]
+
+    else:
+        live = pd.DataFrame()
+
+    # ========================================================
+    # 3. FUTURE FORECAST DATA — NEXT 24 HOURS
+    # ========================================================
+
+    latest_time = pd.Timestamp.now().floor("h")
+    all_locations = akl_big["location_id"].unique()
+
+    future_rows = []
+
+    latest_hist = (
+        akl_big.sort_values("timestamp_hour")
+        .groupby("location_id")
+        .tail(1)
+    )
+
+    latest_lookup = latest_hist.set_index("location_id")
+
+    for loc in all_locations:
+
+        if loc not in latest_lookup.index:
+            continue
+
+        base_row = latest_lookup.loc[loc]
+
+        for h in range(1, 25):
+
+            future_ts = latest_time + timedelta(hours=h)
+
+            row = {
+                "location_id": loc,
+                "street": extract_street(loc),
+                "timestamp": future_ts,
+                "date": future_ts.date(),
+                "hour": future_ts.hour,
+                "day_of_week": future_ts.dayofweek,
+                "month": future_ts.month,
+                "is_weekend": 1 if future_ts.dayofweek >= 5 else 0,
+                "temperature": base_row["temperature"],
+                "precipitation": base_row["precipitation"],
+                "is_rain": base_row["is_rain"],
+                "rain_level": base_row["rain_level"]
+            }
+
+            row["hour_sin"] = np.sin(2 * np.pi * row["hour"] / 24)
+            row["hour_cos"] = np.cos(2 * np.pi * row["hour"] / 24)
+            row["hour_weekend"] = row["hour"] * row["is_weekend"]
+            row["rain_hour"] = row["hour"] * row["is_rain"]
+            row["temp_hour"] = row["hour"] * row["temperature"]
+
+            row["location_encoded"] = location_map.get(loc, -1)
+
+            future_rows.append(row)
+
+    forecast = pd.DataFrame(future_rows)
+
+    if len(forecast) > 0:
+
+        pred_forecast = model_nolag.predict(forecast[features_nolag])
+        pred_forecast = np.clip(pred_forecast, 0, 1)
+
+        forecast["occupancy_rate"] = 0
+        forecast["availability_rate"] = 0
+
+        forecast["predicted_occupancy_rate"] = (pred_forecast * 100).round(2)
+        forecast["forecast_lower"] = (forecast["predicted_occupancy_rate"] - 5).clip(0, 100)
+        forecast["forecast_upper"] = (forecast["predicted_occupancy_rate"] + 5).clip(0, 100)
+
+        forecast["total_spaces"] = forecast["location_id"].map(total_spaces_map).fillna(0)
+        forecast["available_spaces"] = (
+            forecast["total_spaces"] *
+            (1 - forecast["predicted_occupancy_rate"] / 100)
+        ).round(0)
+
+        forecast["cars"] = 0
+        forecast["predicted_cars"] = (
+            forecast["total_spaces"] *
+            forecast["predicted_occupancy_rate"] / 100
+        ).round(0)
+
+        forecast["lat"] = forecast["location_id"].map(lambda x: safe_coords(x)[0])
+        forecast["lon"] = forecast["location_id"].map(lambda x: safe_coords(x)[1])
+
+        forecast["demand_level"] = forecast["predicted_occupancy_rate"].apply(
+            demand_level_from_percent
+        )
+
+        forecast["day_name"] = pd.to_datetime(forecast["timestamp"]).dt.day_name()
+
+        forecast["data_type"] = "Forecast"
+        forecast["last_updated"] = pd.Timestamp.now()
+        forecast["api_status"] = "Forecast"
+        forecast["parking_type"] = "Forecast"
+
+        forecast["current_occupancy"] = forecast["occupancy_rate"]
+        forecast["predicted_next"] = forecast["predicted_occupancy_rate"]
+        forecast["predicted_next_hour"] = forecast["predicted_occupancy_rate"]
+
+    else:
+        forecast = pd.DataFrame()
+
+    # ========================================================
+    # 4. FINAL UNIFIED DATASET
+    # ========================================================
+
+    final_columns = [
+        "timestamp",
+        "date",
+        "location_id",
+        "street",
+        "lat",
+        "lon",
+        "occupancy_rate",
+        "availability_rate",
+        "current_occupancy",
+        "predicted_occupancy_rate",
+        "predicted_next",
+        "predicted_next_hour",
+        "forecast_lower",
+        "forecast_upper",
+        "available_spaces",
+        "total_spaces",
+        "cars",
+        "predicted_cars",
+        "demand_level",
+        "day_name",
+        "hour",
+        "month",
+        "is_weekend",
+        "data_type",
+        "last_updated",
+        "api_status",
+        "parking_type"
+    ]
+
+    combined = pd.concat(
+        [hist, live, forecast],
+        ignore_index=True
+    )
+
+    for col in final_columns:
+        if col not in combined.columns:
+            combined[col] = 0 if col in [
+                "occupancy_rate",
+                "availability_rate",
+                "current_occupancy",
+                "predicted_occupancy_rate",
+                "predicted_next",
+                "predicted_next_hour",
+                "forecast_lower",
+                "forecast_upper",
+                "available_spaces",
+                "total_spaces",
+                "cars",
+                "predicted_cars",
+                "lat",
+                "lon",
+                "hour",
+                "month",
+                "is_weekend"
+            ] else ""
+
+    combined = combined[final_columns]
+
+    # ========================================================
+    # 5. FINAL POWER BI DATA TYPE CLEANING
+    # ========================================================
+
+    numeric_cols = [
+        "lat",
+        "lon",
+        "occupancy_rate",
+        "availability_rate",
+        "current_occupancy",
+        "predicted_occupancy_rate",
+        "predicted_next",
+        "predicted_next_hour",
+        "forecast_lower",
+        "forecast_upper",
+        "available_spaces",
+        "total_spaces",
+        "cars",
+        "predicted_cars",
+        "hour",
+        "month",
+        "is_weekend"
+    ]
+
+    for col in numeric_cols:
+        combined[col] = pd.to_numeric(
+            combined[col],
+            errors="coerce"
+        ).fillna(0)
+
+    integer_cols = [
+        "available_spaces",
+        "total_spaces",
+        "cars",
+        "predicted_cars",
+        "hour",
+        "month",
+        "is_weekend"
+    ]
+
+    for col in integer_cols:
+        combined[col] = combined[col].round(0).astype(int)
+
+    decimal_cols = [
+        "lat",
+        "lon",
+        "occupancy_rate",
+        "availability_rate",
+        "current_occupancy",
+        "predicted_occupancy_rate",
+        "predicted_next",
+        "predicted_next_hour",
+        "forecast_lower",
+        "forecast_upper"
+    ]
+
+    for col in decimal_cols:
+        combined[col] = combined[col].round(2)
+
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"])
+    combined["last_updated"] = pd.to_datetime(combined["last_updated"])
+
+    combined = combined.sort_values(
+        by=["timestamp", "data_type", "street"]
+    )
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    combined.to_csv(output_path, index=False)
+
+    print("CSV exported successfully:")
+    print(output_path)
+
+    print("\nRows by data_type:")
+    print(combined["data_type"].value_counts())
+
+    print("\nData types:")
+    print(combined.dtypes)
+
+    print("\nLive rows:")
+    print(
+        combined[combined["data_type"] == "Live"][
+            [
+                "street",
+                "occupancy_rate",
+                "available_spaces",
+                "total_spaces",
+                "predicted_occupancy_rate"
+            ]
+        ]
+    )
+
+    return combined
+
+
+# ============================================================
+# RUN ONCE
+# ============================================================
+
+parking_powerbi_dashboard = build_powerbi_dataset()
+
+
+# ============================================================
+# OPTIONAL: AUTO UPDATE EVERY 5 MINUTES
+# Run this only when ready
+# ============================================================
+
+# while True:
+#     parking_powerbi_dashboard = build_powerbi_dataset()
+#     print("Waiting 5 minutes...")
+#     time.sleep(300)
